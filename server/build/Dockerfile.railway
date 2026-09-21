@@ -1,0 +1,86 @@
+# syntax=docker/dockerfile:1
+#
+# Builds Mattermost Team Edition from this repository's source (webapp + server)
+# for Railway. The official server/build/Dockerfile downloads a release tarball
+# instead of compiling, and its VOLUME instruction is rejected by Railway.
+#
+# Build context: repository root (see railway.json).
+
+# ---------------------------------------------------------------------------
+# 1) Web app
+# ---------------------------------------------------------------------------
+FROM node:24-bookworm AS webapp
+
+WORKDIR /src/webapp
+COPY webapp/ ./
+
+ENV NODE_OPTIONS=--max-old-space-size=8192
+RUN npm ci --no-audit --no-fund \
+  && npm run build
+
+# ---------------------------------------------------------------------------
+# 2) Server binaries + distribution layout
+#    No enterprise/ directory in this repository => Team Edition (MIT).
+# ---------------------------------------------------------------------------
+FROM golang:1.26-bookworm AS server
+
+ARG RAILWAY_GIT_COMMIT_SHA=local
+ENV BUILD_NUMBER=11.11.0-wyre-${RAILWAY_GIT_COMMIT_SHA}
+
+WORKDIR /src/server
+COPY NOTICE.txt README.md /src/
+COPY server/ ./
+COPY --from=webapp /src/webapp/channels/dist /src/webapp/channels/dist
+
+RUN make build-linux-amd64 BUILD_NUMBER="${BUILD_NUMBER}" \
+  && make package-prep BUILD_NUMBER="${BUILD_NUMBER}" \
+  && mkdir -p dist/mattermost/bin dist/mattermost/logs dist/mattermost/data \
+       dist/mattermost/plugins dist/mattermost/client/plugins \
+  && if [ -f bin/linux_amd64/mattermost ]; then \
+       cp bin/linux_amd64/mattermost bin/linux_amd64/mmctl dist/mattermost/bin/; \
+     else \
+       cp bin/mattermost bin/mmctl dist/mattermost/bin/; \
+     fi
+
+# ---------------------------------------------------------------------------
+# 3) Runtime
+#    debian-slim instead of distroless: the document-preview tools get their
+#    real shared libraries, and a shell is available for `railway ssh`.
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim
+
+ARG PUID=2000
+ARG PGID=2000
+
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
+    ca-certificates \
+    curl \
+    media-types \
+    mailcap \
+    unrtf \
+    wv \
+    poppler-utils \
+    tidy \
+    tzdata \
+  && rm -rf /var/lib/apt/lists/* \
+  && groupadd --gid ${PGID} mattermost \
+  && useradd --uid ${PUID} --gid ${PGID} --comment "" --home-dir /mattermost mattermost
+
+ENV PATH="/mattermost/bin:${PATH}"
+ENV MM_SERVICESETTINGS_ENABLELOCALMODE="true"
+ENV MM_INSTALL_TYPE="docker"
+
+COPY --from=server --chown=${PUID}:${PGID} /src/server/dist/mattermost /mattermost
+
+# PostgreSQL client SSL directory for sslmode=require
+RUN mkdir -p /mattermost/.postgresql \
+  && chmod 700 /mattermost/.postgresql \
+  && chown -R mattermost:mattermost /mattermost
+
+USER mattermost
+WORKDIR /mattermost
+
+EXPOSE 8065
+
+CMD ["/mattermost/bin/mattermost"]
